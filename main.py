@@ -1,6 +1,5 @@
 import os
 import hmac
-import hashlib
 from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, Request, HTTPException
@@ -27,8 +26,15 @@ def get_env(name: str, required: bool = True, default: Optional[str] = None) -> 
 SUPABASE_URL = get_env("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = get_env("SUPABASE_SERVICE_ROLE_KEY")
 
-# Optional : secret de signature FeexPay
+# Secret partagé FeexPay, transmis via un header statique (type "Bearer"
+# dans le dashboard FeexPay). Ce n'est PAS une signature HMAC du corps :
+# FeexPay envoie simplement la valeur telle quelle, sans calcul de hash.
+# La même valeur doit être configurée des deux côtés.
 FEEPAY_WEBHOOK_SECRET = os.environ.get("FEEPAY_WEBHOOK_SECRET", "")
+
+# Nom du header porte du secret. "Authorization" si Header type = Bearer,
+# sinon le nom du header choisi dans le dashboard.
+FEEPAY_WEBHOOK_HEADER = os.environ.get("FEEPAY_WEBHOOK_HEADER", "Authorization")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
@@ -78,22 +84,39 @@ def constant_time_compare(a: str, b: str) -> bool:
     return hmac.compare_digest(a.encode(), b.encode())
 
 
-def verify_signature(raw_body: bytes, provided_sig: Optional[str]) -> None:
+def _extract_secret(header_value: str) -> str:
+    """
+    Normalise la valeur du header.
+
+    Le dashboard FeeXPay ("Header type: Bearer") peut envoyer soit la valeur
+    brute telle qu'elle est saisie, soit le préfixe "Bearer " ajouté par
+    FeeXPay. On accepte les deux formes pour ne pas dépendre de ce choix.
+    """
+    value = (header_value or "").strip()
+    if value.lower().startswith("bearer "):
+        value = value[7:].strip()
+    return value
+
+
+def verify_webhook_secret(provided_value: Optional[str]) -> None:
+    """
+    Vérifie le secret partagé transmis dans le header.
+
+    NOTE : FeexPay n'envoie pas de signature HMAC du corps de la requête,
+    mais une valeur statique définie dans le dashboard. On compare donc
+    directement la valeur reçue au secret attendu.
+    """
     # Si aucun secret n'est configuré, on skip (mode permissif)
     if not FEEPAY_WEBHOOK_SECRET:
         return
 
-    if not provided_sig:
-        raise HTTPException(status_code=401, detail="Missing signature header")
+    if not provided_value:
+        raise HTTPException(status_code=401, detail="Missing authorization header")
 
-    expected = hmac.new(
-        FEEPAY_WEBHOOK_SECRET.encode(),
-        raw_body,
-        hashlib.sha256
-    ).hexdigest()
-
-    if not constant_time_compare(provided_sig, expected):
-        raise HTTPException(status_code=401, detail="Invalid signature")
+    if not constant_time_compare(
+        _extract_secret(provided_value), FEEPAY_WEBHOOK_SECRET
+    ):
+        raise HTTPException(status_code=401, detail="Invalid webhook secret")
 
 
 # =========================
@@ -180,14 +203,16 @@ def upsert_order(payload: Dict[str, Any]) -> None:
 
 @app.post("/webhooks/feexpay")
 async def feexpay_webhook(request: Request) -> JSONResponse:
-    raw_body = await request.body()
-
-    signature = (
-        request.headers.get("X-Feexpay-Signature")
+    # Secret partagé porté par le header défini dans le dashboard FeeXPay.
+    # On accepte aussi les anciens noms de headers signature pour ne pas
+    # casser un ancien client, mais ils ne sont plus utilisés par FeeXPay.
+    provided_value = (
+        request.headers.get(FEEPAY_WEBHOOK_HEADER)
+        or request.headers.get("X-Feexpay-Signature")
         or request.headers.get("X-Signature")
     )
 
-    verify_signature(raw_body, signature)
+    verify_webhook_secret(provided_value)
 
     try:
         payload = await request.json()

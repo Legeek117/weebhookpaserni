@@ -1,5 +1,7 @@
 import os
 import hmac
+import json
+import re
 from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, Request, HTTPException
@@ -133,40 +135,133 @@ def map_payment_status(provider_status: str) -> str:
     return "pending"
 
 
+# -------------------------
+# Identification de la commande
+# -------------------------
+# Le webhook FeexPay ne transmet PAS de champ `order_number` : ce nom
+# n'apparaît nulle part dans la documentation de l'API v2. Le payload réel
+# documenté est :
+#
+#   {
+#     "reference": "1e636dff-…",     <- identifiant FeexPay (UUID)
+#     "order_id":   "1e636dff-…",     <- id interne FeexPay, PAS le nôtre
+#     "status": "SUCCESSFUL",
+#     "callback_info": "",            <- chaîne vide, ou objet selon l'envoi
+#     "phoneNumber": "2290190877433",
+#     "reseau": "MTN CI", …
+#   }
+#
+# Seul `callback_info` transporte notre donnée : le SDK y place
+# order_number lors de la création du paiement. Selon la doc, il est renvoyé
+# sous forme d'objet quand on en envoie un, mais reste une chaîne (vide) sinon.
+# D'où les deux formes acceptées ci-dessous.
+#
+# En repli, `custom_id` (que nous remplissons avec EP_<orderNumber>_<bcp>)
+# permet de récupérer le numéro de commande.
+# custom_id est construit par le front sous la forme
+# `EP_<orderNumber>_<timestamp><2 majuscules>` (cf. generatePaymentReference).
+# Le timestamp est `Date.now().slice(-6)` : c'est bien 6 chiffres, mais on ne
+# peut pas s'y fier pour valider — une référence tronquée ou un ancien format
+# doit rester lisible. On exige donc un suffixe alphanumérique d'au moins 4
+# caractères, ce qui exclut les simples libellés commençant par 'EP_'.
+#
+# Les numéros de commande contiennent un tiret ('CMD-RJOWEFM') : la classe est
+# large et non gloutonne pour s'arrêter au dernier séparateur valide.
+_ORDER_REF_RE = re.compile(r"^EP_(.+?)_[A-Z0-9]{6,}$")
+
+
+def _as_dict(value: Any) -> Dict[str, Any]:
+    """Normalise callback_info en dictionnaire.
+
+    FeexPay renvoie soit un objet JSON, soit une chaîne (vide le plus
+    souvent, mais elle peut contenir du JSON sérialisé).
+    """
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, dict) else {}
+        except (ValueError, TypeError):
+            return {}
+    return {}
+
+
+def extract_order_ref(payload: Dict[str, Any]) -> Optional[str]:
+    """Retrouve le numéro de commande (ex. 'CMD-RJOWEFM') dans la notification.
+
+    Ordre de recherche : callback_info.order_number, puis custom_id, puis
+    callback_info.order / id. Ne retourne None que si rien ne correspond — cas
+    qui doit empêcher toute écriture en base (cf. upsert_order).
+    """
+    info = _as_dict(payload.get("callback_info"))
+
+    for key in ("order_number", "orderNumber", "order", "id"):
+        value = info.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+
+    # custom_id a été envoyé sous le nom "customId" par le SDK.
+    for key in ("custom_id", "customId"):
+        value = payload.get(key)
+        if not isinstance(value, str) or not value.strip():
+            continue
+
+        value = value.strip()
+        match = _ORDER_REF_RE.match(value)
+        if match:
+            return match.group(1)
+
+        # Une valeur commençant par 'EP_' mais ne respectant pas le format
+        # n'est pas un numéro de commande exploitable : on l'ignore plutôt
+        # que de la renvoyer telle quelle, ce qui polluerait la base.
+        if not value.upper().startswith("EP_"):
+            return value
+
+    return None
+
+
 def upsert_order(payload: Dict[str, Any]) -> None:
     tx_id = payload.get("transaction_id") or payload.get("reference")
-    order_ref = payload.get("order_number") or payload.get("reference")
+    order_ref = extract_order_ref(payload)
     provider_status = payload.get("status") or payload.get("payment_status")
     provider_name = payload.get("payment_provider") or "feexpay"
 
-    if not tx_id and not order_ref:
-        raise HTTPException(
-            status_code=400,
-            detail="transaction_id or order_number is required"
+    # Sans identifiant de commande, on ne touche pas à la base. FeeexPay
+    # émet plusieurs notifications par transaction : insérer ici créerait des
+    # lignes fantômes (sans id ni date, donc déjà malformées) à chaque
+    # notification d'une commande qu'on n'arrive pas à rattacher.
+    if not order_ref:
+        print(
+            f"[feexpay] notification sans identifiant de commande, ignorée "
+            f"(reference={tx_id}, callback_info={payload.get('callback_info')!r})",
+            flush=True,
         )
+        return
 
     status_app = map_payment_status(provider_status or "")
 
     # 1️⃣ Update par order_number
-    if order_ref:
-        existing = (
-            supabase.table("orders")
-            .select("id")
-            .eq("order_number", order_ref)
-            .limit(1)
-            .execute()
-        )
-        if existing.data:
-            supabase.table("orders").update({
-                "transaction_id": tx_id,
-                "payment_reference": order_ref,
-                "payment_provider": provider_name,
-                "payment_status": provider_status,
-                "status": status_app,
-            }).eq("order_number", order_ref).execute()
-            return
+    existing = (
+        supabase.table("orders")
+        .select("id")
+        .eq("order_number", order_ref)
+        .limit(1)
+        .execute()
+    )
+    if existing.data:
+        supabase.table("orders").update({
+            "transaction_id": tx_id,
+            "payment_reference": order_ref,
+            "payment_provider": provider_name,
+            "payment_status": provider_status,
+            "status": status_app,
+        }).eq("order_number", order_ref).execute()
+        print(f"[feexpay] commande {order_ref} -> {status_app}", flush=True)
+        return
 
-    # 2️⃣ Update par transaction_id
+    # 2️⃣ Update par transaction_id (une commande déjà rattachée à cette
+    # transaction, mais dont le numéro a changé côté base).
     if tx_id:
         existing_tx = (
             supabase.table("orders")
@@ -177,24 +272,29 @@ def upsert_order(payload: Dict[str, Any]) -> None:
         )
         if existing_tx.data:
             supabase.table("orders").update({
+                "order_number": order_ref,
                 "payment_reference": order_ref,
                 "payment_provider": provider_name,
                 "payment_status": provider_status,
                 "status": status_app,
             }).eq("transaction_id", tx_id).execute()
+            print(
+                f"[feexpay] commande rattachée par transaction {tx_id} "
+                f"-> {order_ref} ({status_app})",
+                flush=True,
+            )
             return
 
-    # 3️⃣ Insert minimal si inexistant
-    supabase.table("orders").insert({
-        "order_number": order_ref,
-        "transaction_id": tx_id,
-        "payment_reference": order_ref,
-        "payment_provider": provider_name,
-        "payment_status": provider_status,
-        "status": status_app,
-        "total_amount": payload.get("amount"),
-        "notes": "Created by FeexPay webhook",
-    }).execute()
+    # 3️⃣ Commande inconnue : on ne crée PAS de ligne partielle. Une commande
+    # est toujours créée par le site au moment du checkout ; une notification
+    # qui ne la retrouve pas signifie que le numéro de commande envoyé n'est
+    # pas lebon (format changed, commande supprimée…). Créer une ligne
+    # minimaliste masquerait le problème et fausserait les statistiques.
+    print(
+        f"[feexpay] aucune commande ne correspond à {order_ref} "
+        f"(reference={tx_id}) : notification ignorée",
+        flush=True,
+    )
 
 
 # =========================

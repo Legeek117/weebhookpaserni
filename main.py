@@ -2,12 +2,17 @@ import os
 import hmac
 import json
 import re
+import asyncio
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client, Client
+
+# Fréquence du nettoyage des commandes abandonnées.
+CLEANUP_INTERVAL_SECONDS = 60 * 60 * 6  # toutes les 6 heures
 
 
 # =========================
@@ -327,3 +332,64 @@ async def feexpay_webhook(request: Request) -> JSONResponse:
         raise HTTPException(status_code=500, detail=str(e))
 
     return JSONResponse({"ok": True})
+
+
+# =========================
+# Nettoyage des commandes abandonnées
+# =========================
+# La commande est désormais créée AVANT le paiement (statut 'pending'), ce
+# qui laisse une trace des paniers abandonnés : le client remplit le
+# formulaire, puis ferme l'onglet ou abandonne le paiement.
+#
+# Sans nettoyage ces lignes s'accumulent et brouillent les statistiques. On
+# supprime celles restées 'pending' sans transaction au-delà de 48 h, ce qui
+# laisse largement le temps au webhook de confirmer un paiement tardif.
+#
+# Le délai de 48 h est aussi celui que le client accepte d'attendre avant de
+# réessayer, donc une suppression ne peut pas viser une commande encore en
+# cours de traitement.
+
+STALE_ORDER_HOURS = 48
+
+
+def cleanup_stale_orders() -> int:
+    """Supprime les commandes 'pending' sans transaction de plus de 48 h."""
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=STALE_ORDER_HOURS)
+    try:
+        response = (
+            supabase.table("orders")
+            .delete()
+            .eq("status", "pending")
+            .is_("transaction_id", "null")
+            .lt("created_at", cutoff.isoformat())
+            .execute()
+        )
+        deleted = getattr(response, "data", None) or []
+        count = len(deleted)
+        if count:
+            print(f"[cleanup] {count} commande(s) pending abandonnées supprimée(s)", flush=True)
+        return count
+    except Exception as e:
+        # Une erreur de nettoyage ne doit jamais interrompre le service.
+        print(f"[cleanup] échec du nettoyage : {e}", flush=True)
+        return 0
+
+
+@app.on_event("startup")
+async def start_cleanup_task() -> None:
+    """Lance la boucle de nettoyage au démarrage du service."""
+    async def loop() -> None:
+        # Premier passage décalé : on laisse le temps au service de démarrer
+        # proprement avant d'interroger Supabase.
+        await asyncio.sleep(30)
+        while True:
+            await asyncio.to_thread(cleanup_stale_orders)
+            await asyncio.sleep(CLEANUP_INTERVAL_SECONDS)
+
+    task = asyncio.create_task(loop())
+    _cleanup_task = task
+    print(
+        f"[cleanup] tâche de fond démarrée (toutes les {CLEANUP_INTERVAL_SECONDS}s, "
+        f" commandes de plus de {STALE_ORDER_HOURS}h)",
+        flush=True,
+    )
